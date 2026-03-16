@@ -37,10 +37,27 @@ __all__ = ["HFRollout"]
 
 
 class HFRollout(BaseRollout):
+    # ── [seek-apps fork] HFRollout uses shared FSDP actor — async weight management
+    # methods (resume/update_weights/release) are no-ops since weights are always
+    # live via the FSDP reference. Required to satisfy BaseRollout's ABC contract.
+
     def __init__(self, module: nn.Module, config):
-        super().__init__()
+        # Skip BaseRollout.__init__ — it expects (config, model_config, device_mesh)
+        # for the async server architecture, which HFRollout doesn't use.
         self.config = config
         self.module = module
+
+    async def resume(self, tags: list[str]):
+        """No-op — HFRollout shares FSDP actor, weights are always live."""
+        pass
+
+    async def update_weights(self, weights, **kwargs):
+        """No-op — HFRollout uses FSDP actor weights directly."""
+        pass
+
+    async def release(self):
+        """No-op — HFRollout has no separate GPU memory to release."""
+        pass
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         batch_size = prompts.batch.batch_size[0]
