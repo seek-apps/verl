@@ -324,7 +324,8 @@ class RayPPOTrainer:
                 self.processor,
                 max_samples=self.config.data.get("train_max_samples", -1),
             )
-        if val_dataset is None:
+        # ── [seek-apps fork] allow val_files: null to skip validation dataset creation ──
+        if val_dataset is None and self.config.data.val_files is not None:
             val_dataset = create_rl_dataset(
                 self.config.data.val_files,
                 self.config.data,
