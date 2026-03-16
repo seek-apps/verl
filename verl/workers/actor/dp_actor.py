@@ -638,6 +638,26 @@ class DataParallelPPOActor(BasePPOActor):
                         micro_batch_metrics.update(rollout_corr_metrics)
 
                     policy_loss = pg_loss
+
+                    # ── [seek-apps fork] LLDS — Lazy Likelihood Displacement Stabilization ──
+                    # arXiv:2512.04220. Regularizes displaced tokens in positive-advantage completions.
+                    # Config: actor_rollout_ref.actor.llds_coef (default 0.0 = disabled).
+                    llds_coef = getattr(self.config, "llds_coef", 0.0)
+                    if llds_coef > 0.0:
+                        from verl.trainer.ppo.core_algos import compute_llds_loss
+
+                        llds_loss, llds_mask = compute_llds_loss(
+                            log_prob=log_prob,
+                            old_log_prob=old_log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                        )
+                        policy_loss = policy_loss + llds_coef * llds_loss
+                        micro_batch_metrics["actor/llds_loss"] = llds_loss.detach().item()
+                        micro_batch_metrics["actor/llds_mask_ratio"] = (
+                            llds_mask.sum() / response_mask.sum().clamp(min=1)
+                        ).item()
+
                     if calculate_entropy and entropy is not None:
                         entropy_agg = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
                         micro_batch_metrics["actor/entropy"] = entropy_agg.detach().item()
