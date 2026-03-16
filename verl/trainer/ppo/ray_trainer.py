@@ -495,12 +495,42 @@ class RayPPOTrainer:
         # For agent loop, we need reward model keys to compute score.
         gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
 
-        # ── [seek-apps fork] HF rollout: restore pre-tokenized tensors in gen_batch ──────────────
-        # The async server (vLLM/sglang) tokenizes from non_tensor_batch text.
-        # HFRollout.generate_sequences expects input_ids/attention_mask/position_ids in batch.
-        # batch.batch is NOT popped above (batch_keys_to_pop=[]) so the tensors are still there.
-        if self.config.actor_rollout_ref.rollout.name == "hf" and batch.batch is not None:
-            gen_batch.batch = batch.batch.clone()
+        # ── [seek-apps fork] HF rollout: tokenize raw_prompt into input_ids/attention_mask/position_ids ──
+        # In the async architecture, RLHFDataset only puts raw_prompt (chat messages) in non_tensor_batch
+        # and dummy_tensor as a placeholder. The async server (vLLM/sglang) tokenizes inside AgentLoop.
+        # HFRollout.generate_sequences expects pre-tokenized input_ids in batch.batch — we do it here.
+        if self.config.actor_rollout_ref.rollout.name == "hf":
+            raw_prompts = gen_batch.non_tensor_batch.get("raw_prompt", None)
+            if raw_prompts is not None:
+                max_prompt_length = self.config.data.max_prompt_length
+                tokenizer = self.tokenizer
+                # Apply chat template and tokenize each prompt (left-pad to max_prompt_length)
+                encoded = tokenizer(
+                    [
+                        tokenizer.apply_chat_template(
+                            list(p), add_generation_prompt=True, tokenize=False
+                        )
+                        for p in raw_prompts
+                    ],
+                    return_tensors="pt",
+                    padding="max_length",
+                    max_length=max_prompt_length,
+                    truncation=True,
+                    padding_side="left",
+                )
+                input_ids = encoded["input_ids"]
+                attention_mask = encoded["attention_mask"]
+                # position_ids: cumsum of attention_mask (0-indexed positions, 0 for padding)
+                position_ids = (attention_mask.cumsum(dim=-1) - 1).clamp(min=0)
+                from tensordict import TensorDict
+                gen_batch.batch = TensorDict(
+                    {
+                        "input_ids": input_ids,
+                        "attention_mask": attention_mask,
+                        "position_ids": position_ids,
+                    },
+                    batch_size=input_ids.shape[0],
+                )
 
         return gen_batch
 
@@ -1448,7 +1478,7 @@ class RayPPOTrainer:
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
                     # get images_seqlens
                     images_seqlens_all = []
-                    for multi_modal_input in batch.non_tensor_batch["multi_modal_inputs"]:
+                    for multi_modal_input in batch.non_tensor_batch.get("multi_modal_inputs", []):
                         if "image_grid_thw" not in multi_modal_input.keys():
                             continue
                         images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
@@ -1456,6 +1486,14 @@ class RayPPOTrainer:
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
+                            batch_reward = self._compute_reward_colocate(batch)
+                            batch = batch.union(batch_reward)
+                        # ── [seek-apps fork] HF rollout: reward not computed during rollout (no agent loop).
+                        # Compute it explicitly here. In the async path (vLLM/sglang), the agent loop calls
+                        # the reward function during generation and puts rm_scores in the batch. HF rollout
+                        # bypasses the agent loop, so we compute rewards synchronously after generation.
+                        elif not self.use_rm and self.config.actor_rollout_ref.rollout.name == "hf" \
+                                and "rm_scores" not in batch.batch.keys():
                             batch_reward = self._compute_reward_colocate(batch)
                             batch = batch.union(batch_reward)
 
