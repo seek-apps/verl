@@ -288,7 +288,8 @@ class TaskRunner:
         OmegaConf.resolve(config)
 
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
-        self.add_critic_worker(config)
+        if need_critic(config):
+            self.add_critic_worker(config)
 
         self.add_reward_model_resource_pool(config)
 
@@ -329,13 +330,20 @@ class TaskRunner:
             is_train=True,
             max_samples=config.data.get("train_max_samples", -1),
         )
-        val_dataset = create_rl_dataset(
-            config.data.val_files,
-            config.data,
-            tokenizer,
-            processor,
-            is_train=False,
-            max_samples=config.data.get("val_max_samples", -1),
+        # ── [seek-apps fork] allow val_files: null to skip validation dataset creation ──
+        # Upstream unconditionally calls create_rl_dataset even when val_files is None,
+        # causing TypeError when test_freq: -1 (no validation intended). Guard it here.
+        val_dataset = (
+            create_rl_dataset(
+                config.data.val_files,
+                config.data,
+                tokenizer,
+                processor,
+                is_train=False,
+                max_samples=config.data.get("val_max_samples", -1),
+            )
+            if config.data.val_files is not None
+            else None
         )
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
