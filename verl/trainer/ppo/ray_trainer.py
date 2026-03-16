@@ -495,6 +495,13 @@ class RayPPOTrainer:
         # For agent loop, we need reward model keys to compute score.
         gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
 
+        # ── [seek-apps fork] HF rollout: restore pre-tokenized tensors in gen_batch ──────────────
+        # The async server (vLLM/sglang) tokenizes from non_tensor_batch text.
+        # HFRollout.generate_sequences expects input_ids/attention_mask/position_ids in batch.
+        # batch.batch is NOT popped above (batch_keys_to_pop=[]) so the tensors are still there.
+        if self.config.actor_rollout_ref.rollout.name == "hf" and batch.batch is not None:
+            gen_batch.batch = batch.batch.clone()
+
         return gen_batch
 
     def _compute_reward_colocate(self, batch: DataProto) -> tuple[torch.Tensor, dict[str, Any]] | torch.Tensor:
