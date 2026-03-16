@@ -353,25 +353,30 @@ class RayPPOTrainer:
             sampler=train_sampler,
         )
 
-        val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
-        if val_batch_size is None:
-            val_batch_size = len(self.val_dataset)
+        # ── [seek-apps fork] skip val_dataloader when val_dataset is None (test_freq: -1) ──
+        if self.val_dataset is not None:
+            val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
+            if val_batch_size is None:
+                val_batch_size = len(self.val_dataset)
 
-        self.val_dataloader = StatefulDataLoader(
-            dataset=self.val_dataset,
-            batch_size=val_batch_size,
-            num_workers=num_workers,
-            shuffle=self.config.data.get("validation_shuffle", True),
-            drop_last=False,
-            collate_fn=collate_fn,
-        )
+            self.val_dataloader = StatefulDataLoader(
+                dataset=self.val_dataset,
+                batch_size=val_batch_size,
+                num_workers=num_workers,
+                shuffle=self.config.data.get("validation_shuffle", True),
+                drop_last=False,
+                collate_fn=collate_fn,
+            )
+        else:
+            self.val_dataloader = None
 
         assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
-        assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
+        assert self.val_dataloader is None or len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
 
+        val_size_str = len(self.val_dataloader) if self.val_dataloader is not None else "N/A (disabled)"
         print(
             f"Size of train dataloader: {len(self.train_dataloader)}, Size of val dataloader: "
-            f"{len(self.val_dataloader)}"
+            f"{val_size_str}"
         )
 
         total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
@@ -1319,7 +1324,8 @@ class RayPPOTrainer:
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
-        if self.config.trainer.get("val_before_train", True):
+        # ── [seek-apps fork] skip pre-train validation when val_dataset is None ──
+        if self.config.trainer.get("val_before_train", True) and self.val_dataloader is not None:
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
