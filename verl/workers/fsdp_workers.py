@@ -719,9 +719,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 4. build rollout model
         log_gpu_memory_usage(f"Before building {self.config.rollout.name} rollout", logger=logger)
-        self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
-            config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
-        )
+        if rollout_name == "hf":
+            # ── [seek-apps fork] HF rollout: bypass async server registry, use FSDP module directly ──
+            # get_rollout_class("hf", "async") fails (HF not registered in async registry).
+            # HFRollout uses actor_module_fsdp directly — no separate inference server needed.
+            # Related: verl issue #1940 (HF rollout broken after async rollout refactor).
+            from verl.workers.rollout.hf_rollout import HFRollout
+
+            self.rollout = HFRollout(module=self.actor_module_fsdp, config=self.config.rollout)
+        else:
+            self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
+                config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
+            )
         log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
 
         # Full params
@@ -1058,7 +1067,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         prompts.meta_info.update(meta_info)
 
         timing_generate = {}
-        if self._is_actor:  # For rollout only, we do not switch context.
+        # ── [seek-apps fork] HF rollout uses actor_module_fsdp directly — no server weight sync ──
+        # rollout_mode() syncs FSDP weights to the vLLM/sglang server. For HF rollout,
+        # weights are already live in the FSDP module — no sync step needed.
+        _need_context_switch = self._is_actor and self.config.rollout.name != "hf"
+        if _need_context_switch:
             loop = get_event_loop()
             loop.run_until_complete(self.rollout_mode())
             log_gpu_memory_usage("After switch to rollout mode", logger=logger)
@@ -1066,7 +1079,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         with simple_timer("generate_sequences", timing_generate):
             output = self.rollout.generate_sequences(prompts=prompts)
 
-        if self._is_actor:
+        if _need_context_switch:
             loop.run_until_complete(self.trainer_mode())
             log_gpu_memory_usage("After switch to trainer mode", logger=logger)
 
@@ -1733,5 +1746,7 @@ class CriticWorker(Worker, DistProfilerExtension):
 class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None):
-        await self.rollout_mode()
+        # ── [seek-apps fork] HF rollout: skip rollout_mode() — weights always live in FSDP module ──
+        if self.config.rollout.name != "hf":
+            await self.rollout_mode()
         return True

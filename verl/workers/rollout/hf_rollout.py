@@ -38,9 +38,19 @@ __all__ = ["HFRollout"]
 
 class HFRollout(BaseRollout):
     def __init__(self, module: nn.Module, config):
-        super().__init__()
+        # ── [seek-apps fork] Skip BaseRollout.__init__ — HFRollout uses the actor FSDP module
+        # directly. BaseRollout.__init__ expects (config, model_config, device_mesh) for the
+        # async server-based rollouts (vllm/sglang/trtllm). HFRollout bypasses that path.
+        # Related: verl issue #1940 (HF rollout broken after async rollout refactor).
         self.config = config
         self.module = module
+
+    # Abstract methods from BaseRollout — no-ops for HF rollout (weights always live in FSDP module)
+    async def resume(self, tags): pass
+
+    async def update_weights(self, weights, **kwargs): pass
+
+    async def release(self): pass
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         batch_size = prompts.batch.batch_size[0]
