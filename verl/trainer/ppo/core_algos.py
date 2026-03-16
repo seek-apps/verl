@@ -2481,3 +2481,46 @@ def compute_policy_loss_bypass_mode(
     pg_metrics.update(rollout_metrics)
 
     return pg_loss, pg_metrics
+
+
+# ── [seek-apps fork] LLDS — Lazy Likelihood Displacement Stabilization (arXiv:2512.04220) ────
+# Auxiliary loss that penalizes silent log-prob decay on correct/positive completions.
+# Three-level gate: trajectory (response-level decline) + token (displaced) + action (adv ≥ 0).
+# Addresses training collapse precursor where reward looks stable but correct-answer log-probs
+# silently decrease. Config: actor_rollout_ref.actor.llds_coef (default 0.0 = disabled).
+def compute_llds_loss(
+    log_prob: torch.Tensor,
+    old_log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """LLDS auxiliary loss — arXiv:2512.04220.
+
+    Args:
+        log_prob: (bs, seq_len) current policy log probs
+        old_log_prob: (bs, seq_len) rollout-time log probs
+        advantages: (bs, seq_len)
+        response_mask: (bs, seq_len)
+
+    Returns:
+        (loss, llds_mask) — loss scalar and gate mask for metrics.
+    """
+    eps = 1e-8
+    mask_sum = response_mask.sum(-1, keepdim=True).clamp(min=1)
+
+    # 1. Trajectory gate: mean log-prob decreased for this response
+    mean_new = (log_prob * response_mask).sum(-1, keepdim=True) / mask_sum
+    mean_old = (old_log_prob * response_mask).sum(-1, keepdim=True) / mask_sum
+    traj_gate = (mean_new < mean_old - eps).float()  # (bs, 1)
+
+    # 2. Token gate: this token displaced downward
+    token_gate = (log_prob < old_log_prob - eps).float()  # (bs, seq_len)
+
+    # 3. Action gate: non-negative advantage (correct completions only)
+    resp_adv = (advantages * response_mask).sum(-1, keepdim=True) / mask_sum
+    action_gate = (resp_adv >= 0).float()  # (bs, 1)
+
+    llds_mask = traj_gate * token_gate * action_gate * response_mask
+    displacement = (old_log_prob - log_prob) * llds_mask
+    loss = displacement.sum() / llds_mask.sum().clamp(min=1)
+    return loss, llds_mask

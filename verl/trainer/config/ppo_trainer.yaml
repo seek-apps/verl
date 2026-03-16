@@ -99,6 +99,13 @@ algorithm:
     # Target KL divergence (used for adaptive controller)
     target_kl: 0.1
 
+  # [seek-apps fork] filter_groups — DAPO dynamic sampling (arXiv:2409.07236 §3.2)
+  # Removes groups where all completions have identical reward (zero advantage → zero gradient).
+  filter_groups:
+    enable: False           # set True to activate
+    metric: seq_reward      # aggregation metric (informational; seq sum used internally)
+    max_num_gen_batches: 0  # retry batches (0 = warn and proceed without retry)
+
   # Whether to enable preference feedback PPO
   use_pf_ppo: False
 

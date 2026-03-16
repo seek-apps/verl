@@ -1085,6 +1085,69 @@ class RayPPOTrainer:
         )
         metrics.update(global_balance_stats)
 
+    # ── [seek-apps fork] filter_groups — DAPO dynamic sampling (arXiv:2409.07236 §3.2) ──────────
+    # Filters groups where all completions have identical reward (std ≈ 0 → zero advantage → zero
+    # gradient). Ported from DAPO recipe into main trainer. Backward-compatible: off by default.
+    # Config: algorithm.filter_groups.enable (default False).
+    def _apply_filter_groups(self, batch: "DataProto", target_size: int, max_retries: int = 0) -> "DataProto":
+        """Remove zero-advantage groups from batch.
+
+        Groups are identified by ``uid`` in non_tensor_batch. Groups where all completions have
+        identical token_level_scores (std < 1e-6) produce zero advantage and zero gradient.
+
+        Args:
+            batch: Current training batch with token_level_scores and uid fields.
+            target_size: Minimum number of prompts (unique uids) desired.
+            max_retries: Warn after this many filtering attempts. 0 = warn once and proceed.
+
+        Returns:
+            Filtered batch with zero-variance groups removed.
+        """
+        scores = batch.batch.get("token_level_scores", None)
+        if scores is None:
+            return batch
+
+        seq_scores = scores.sum(-1) if scores.dim() > 1 else scores  # (bs,)
+        uids = batch.non_tensor_batch["uid"]
+
+        uid_map: dict = {}
+        for i, uid in enumerate(uids):
+            uid_map.setdefault(uid, []).append(i)
+
+        keep_indices = []
+        for uid, indices in uid_map.items():
+            group_scores = seq_scores[indices]
+            if group_scores.std() > 1e-6:
+                keep_indices.extend(indices)
+
+        n_before = len(uid_map)
+        n_after = len(set(uids[i] for i in keep_indices)) if keep_indices else 0
+        n_filtered = n_before - n_after
+
+        if n_filtered > 0:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(
+                f"[filter_groups] Filtered {n_filtered}/{n_before} zero-advantage groups "
+                f"({n_filtered / n_before:.1%} of batch)"
+            )
+
+        if not keep_indices:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning("[filter_groups] All groups filtered — returning original batch unchanged")
+            return batch
+
+        if n_after < target_size:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                f"[filter_groups] After filtering: {n_after} groups < target {target_size}. "
+                "Proceeding with reduced batch (no retry support in main trainer)."
+            )
+
+        return batch.select_idxs(keep_indices)
+
     def _compute_values(self, batch: DataProto) -> DataProto:
         if self.use_legacy_worker_impl == "disable":
             batch_td = batch.to_tensordict()
@@ -1478,6 +1541,15 @@ class RayPPOTrainer:
                             # IS and off-policy metrics already have rollout_corr/ prefix
                             metrics.update(is_metrics)
 
+                        # ── [seek-apps fork] filter_groups — remove zero-advantage groups ──
+                        fg_config = getattr(self.config.algorithm, "filter_groups", None)
+                        if fg_config is not None and getattr(fg_config, "enable", False):
+                            batch = self._apply_filter_groups(
+                                batch,
+                                target_size=self.config.data.train_batch_size,
+                                max_retries=getattr(fg_config, "max_num_gen_batches", 0),
+                            )
+
                         # compute advantages, executed on the driver process
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(
                             "norm_adv_by_std_in_grpo", True
@@ -1586,6 +1658,15 @@ class RayPPOTrainer:
                             metrics[f"gdpo/{key}/std"] = float(np.std(vals))
                             metrics[f"gdpo/{key}/max"] = float(np.max(vals))
                             metrics[f"gdpo/{key}/min"] = float(np.min(vals))
+                # Log per-step mean for extra reward info keys (non-GDPO path).
+                # Surfaces compute_score dict keys (format_reward, grounding_reward, etc.) as MLflow step metrics.
+                if reward_extra_infos_dict and self.config.algorithm.adv_estimator not in ("gdpo", AdvantageEstimator.GDPO):
+                    for key, vals in reward_extra_infos_dict.items():
+                        if key in ("reward", "score"):
+                            continue  # already logged as reward/mean
+                        filtered = [v for v in vals if v != -1.0]
+                        if filtered:
+                            metrics[f"reward/{key}_mean"] = float(np.mean(filtered))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()

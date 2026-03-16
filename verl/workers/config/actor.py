@@ -176,6 +176,8 @@ class ActorConfig(BaseConfig):
     rollout_n: int = MISSING  # must be override by sampling config
     model_config: HFModelConfig = field(default_factory=BaseConfig)
     router_replay: RouterReplayConfig = field(default_factory=RouterReplayConfig)
+    # ── [seek-apps fork] LLDS auxiliary loss weight (arXiv:2512.04220). 0.0 = disabled. ──
+    llds_coef: float = 0.0
 
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size
