@@ -412,7 +412,7 @@ class RayPPOTrainer:
         }
 
         for k, v in reward_extra_infos_dict.items():
-            if len(v) == n:
+            if hasattr(v, '__len__') and len(v) == n:
                 base_data[k] = v
 
         lines = []
@@ -448,6 +448,17 @@ class RayPPOTrainer:
                     batch.non_tensor_batch["request_id"].tolist(),
                 )
 
+            # [seek-apps fork] Use batch.non_tensor_batch for reward extras instead of
+            # reward_extra_infos_dict. The dict has pre-filter_groups size (gen_batch_size × n),
+            # while batch has post-filter size (train_batch_size × n). Mismatch causes len check
+            # to fail in _dump_generations.
+            reward_extra_keys = batch.meta_info.get("reward_extra_keys", [])
+            reward_extra_infos_to_dump = {
+                k: batch.non_tensor_batch[k].tolist() if hasattr(batch.non_tensor_batch.get(k, None), 'tolist')
+                else list(batch.non_tensor_batch.get(k, []))
+                for k in reward_extra_keys
+                if k in batch.non_tensor_batch
+            }
             self._dump_generations(
                 inputs=inputs,
                 outputs=outputs,
