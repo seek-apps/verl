@@ -16,20 +16,20 @@ import importlib
 import logging
 import os
 
-# [seek-apps fork] Import unsloth BEFORE anything that transitively pulls in transformers.
-# verl.protocol.DataProto → transformers (via tokenizer utils). If transformers loads first,
-# Unsloth's monkey patches cannot apply → gradient offloading, efficient backward kernels,
-# and memory optimizations are silently broken. This caused 7.6GB unexplained VRAM usage.
-try:
-    import torch
-    if torch.cuda.is_available():
-        import unsloth  # noqa: F401
-except (ImportError, Exception):
-    pass
-
 from packaging.version import parse as parse_version
 
-from .protocol import DataProto
+# [seek-apps fork] Lazy-import DataProto to avoid pulling in transformers at verl import time.
+# verl.protocol.DataProto transitively imports transformers. If transformers loads before
+# Unsloth (which patches transformers at import time), Unsloth's memory optimizations
+# silently fail — gradient offloading, efficient backward kernels all broken.
+# Lazy import lets fsdp_workers.py import unsloth first, then DataProto loads on first access.
+def __getattr__(name):
+    if name == "DataProto":
+        from .protocol import DataProto
+        globals()["DataProto"] = DataProto  # cache for subsequent access
+        return DataProto
+    raise AttributeError(f"module 'verl' has no attribute {name}")
+
 from .utils.device import is_npu_available
 from .utils.import_utils import import_external_libs
 from .utils.logging_utils import set_basic_config

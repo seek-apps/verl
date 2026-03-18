@@ -589,6 +589,10 @@ class DataParallelPPOActor(BasePPOActor):
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
                     log_prob = outputs["log_probs"]
+                    # [seek-apps fork] Clamp log_probs to prevent exact 0.0 in bf16.
+                    # When the model assigns prob ≈ 1.0 to a token, log(1.0) = 0.0 exactly.
+                    # This causes nan gradients in entropy and LLDS loss computation.
+                    log_prob = log_prob.clamp(min=-1e4, max=-1e-4)
                     entropy = outputs["entropys"] if calculate_entropy else None
 
                     # for fully_async_policy
@@ -681,14 +685,29 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss * loss_scale_factor
                     else:
                         loss = policy_loss * loss_scale_factor
-                    # [seek-apps fork] Memory diagnostic before backward — find the 7.6GB mystery allocation
+                    # [seek-apps fork] Training diagnostic
                     if torch.distributed.get_rank() == 0:
-                        print(f"\n{'='*60}")
-                        print(f"[DIAG] Before loss.backward():")
-                        print(f"  allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
-                        print(f"  reserved:  {torch.cuda.memory_reserved()/1e9:.2f} GB")
-                        print(torch.cuda.memory_summary(abbreviated=True))
-                        print(f"{'='*60}\n")
+                        _loss_val = loss.detach().item()
+                        _pg_val = pg_loss.detach().item()
+                        _ent_val = entropy_agg.detach().item() if (calculate_entropy and entropy is not None) else 0.0
+                        _adv_min = advantages.min().item()
+                        _adv_max = advantages.max().item()
+                        # Masked log_prob stats — only look at response tokens
+                        _masked_lp = log_prob[response_mask.bool()]
+                        _lp_min = _masked_lp.min().item() if _masked_lp.numel() > 0 else float('nan')
+                        _lp_max = _masked_lp.max().item() if _masked_lp.numel() > 0 else float('nan')
+                        _lp_zeros = (log_prob == 0.0).sum().item()
+                        _mask_sum = response_mask.sum().item()
+                        _ratio = torch.exp(log_prob - old_log_prob)
+                        _ratio_masked = _ratio[response_mask.bool()]
+                        _has_nan = torch.isnan(_ratio).any().item()
+                        _has_inf = torch.isinf(_ratio).any().item()
+                        print(f"[DIAG] loss={_loss_val:.6f} pg={_pg_val:.6f} ent={_ent_val:.4f} "
+                              f"adv=[{_adv_min:.4f},{_adv_max:.4f}] "
+                              f"logp_masked=[{_lp_min:.2f},{_lp_max:.2f}] "
+                              f"logp_zeros={_lp_zeros} mask_tokens={_mask_sum:.0f} "
+                              f"ratio_nan={_has_nan} ratio_inf={_has_inf} "
+                              f"GPU={torch.cuda.memory_allocated()/1e9:.2f}GB")
                     if self.scaler is not None:
                         self.scaler.scale(loss).backward()
                     else:
