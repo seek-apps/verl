@@ -146,6 +146,8 @@ class HFModelConfig(BaseConfig):
     model_loader: Optional[str] = None  # "unsloth" or None (default HF loading)
     load_in_4bit: bool = False          # QLoRA 4-bit quantization (requires model_loader=unsloth)
     max_seq_length: int = 4096          # Max sequence length for Unsloth RoPE scaling
+    fast_inference: bool = False        # vLLM-backed fast_generate for faster rollout (requires UNSLOTH_VLLM_STANDBY=1)
+    gpu_memory_utilization: float = 0.6 # vLLM KV cache allocation fraction (only used with fast_inference=True)
 
     def __post_init__(self):
         import_external_libs(self.external_lib)
