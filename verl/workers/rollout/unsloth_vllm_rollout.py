@@ -158,7 +158,16 @@ class UnslothVLLMRollout:
             batch_size=batch_size,
         )
 
-        # Clear KV cache
+        # Put vLLM to sleep — releases KV cache memory for training
+        try:
+            from vllm.device_allocator.cumem import CuMemAllocator
+            allocator = CuMemAllocator.get_instance()
+            if hasattr(allocator, 'sleep'):
+                allocator.sleep()
+                logger.info("[UnslothVLLMRollout] vLLM allocator sleeping — KV cache released")
+        except Exception as e:
+            logger.debug(f"[UnslothVLLMRollout] Could not sleep allocator: {e}")
+
         torch.cuda.empty_cache()
 
         return DataProto(batch=batch)
