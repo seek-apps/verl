@@ -1243,23 +1243,27 @@ class RayPPOTrainer:
             # step 2: convert from padding to nopadding
             batch_td = left_right_2_no_padding(batch_td)
             # step 3: add meta info
-            tu.assign_non_tensor(batch_td, calculate_entropy=True, compute_loss=False)
+            # [seek-apps fork] Skip entropy in compute_log_prob to avoid OOM on large-vocab models.
+            # entropy_from_logits materializes 3x the [batch, seq, vocab] tensor (~1.8 GB for 151K vocab).
+            # Entropy here is only used for the actor/entropy METRIC, not training loss.
+            # The actual entropy used in policy loss is computed inside update_actor's forward pass.
+            tu.assign_non_tensor(batch_td, calculate_entropy=False, compute_loss=False)
             output = self.actor_rollout_wg.compute_log_prob(batch_td)
             # gather output
-            entropy = tu.get(output, "entropy")
             log_probs = tu.get(output, "log_probs")
             routed_experts = tu.get(output, "routed_experts")
             old_log_prob_mfu = tu.get(output, "metrics")["mfu"]
             # step 4. No padding to padding
-            entropy = no_padding_2_padding(entropy, batch_td)
             log_probs = no_padding_2_padding(log_probs, batch_td)
             # step 5: rebuild a tensordict and convert to dataproto
+            # Create zero entropy placeholder — actual entropy computed in update_actor with gradients
+            zero_entropy = torch.zeros_like(log_probs)
             if routed_experts is not None:
                 old_log_prob = tu.get_tensordict(
-                    {"old_log_probs": log_probs.float(), "entropys": entropy.float(), "routed_experts": routed_experts}
+                    {"old_log_probs": log_probs.float(), "entropys": zero_entropy.float(), "routed_experts": routed_experts}
                 )
             else:
-                old_log_prob = tu.get_tensordict({"old_log_probs": log_probs.float(), "entropys": entropy.float()})
+                old_log_prob = tu.get_tensordict({"old_log_probs": log_probs.float(), "entropys": zero_entropy.float()})
             old_log_prob = DataProto.from_tensordict(old_log_prob)
         else:
             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
@@ -1541,6 +1545,13 @@ class RayPPOTrainer:
                                     "it should not be set when using R2 mode."
                                 )
                             batch = batch.union(old_log_prob)
+
+                            # [seek-apps fork] Offload old_log_probs to CPU to free ~2.4GB GPU memory
+                            # before update_actor. They travel back to GPU per micro-batch inside the worker.
+                            if "old_log_probs" in batch.batch:
+                                batch.batch["old_log_probs"] = batch.batch["old_log_probs"].cpu()
+                            torch.cuda.empty_cache()
+
                             if "rollout_log_probs" in batch.batch.keys():
                                 # TODO: we may want to add diff of probs too.
                                 from verl.utils.debug.metrics import calculate_debug_metrics

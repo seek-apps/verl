@@ -681,6 +681,14 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss * loss_scale_factor
                     else:
                         loss = policy_loss * loss_scale_factor
+                    # [seek-apps fork] Memory diagnostic before backward — find the 7.6GB mystery allocation
+                    if torch.distributed.get_rank() == 0:
+                        print(f"\n{'='*60}")
+                        print(f"[DIAG] Before loss.backward():")
+                        print(f"  allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+                        print(f"  reserved:  {torch.cuda.memory_reserved()/1e9:.2f} GB")
+                        print(torch.cuda.memory_summary(abbreviated=True))
+                        print(f"{'='*60}\n")
                     if self.scaler is not None:
                         self.scaler.scale(loss).backward()
                     else:

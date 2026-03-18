@@ -16,6 +16,17 @@ import importlib
 import logging
 import os
 
+# [seek-apps fork] Import unsloth BEFORE anything that transitively pulls in transformers.
+# verl.protocol.DataProto → transformers (via tokenizer utils). If transformers loads first,
+# Unsloth's monkey patches cannot apply → gradient offloading, efficient backward kernels,
+# and memory optimizations are silently broken. This caused 7.6GB unexplained VRAM usage.
+try:
+    import torch
+    if torch.cuda.is_available():
+        import unsloth  # noqa: F401
+except (ImportError, Exception):
+    pass
+
 from packaging.version import parse as parse_version
 
 from .protocol import DataProto

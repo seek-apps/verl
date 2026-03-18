@@ -15,6 +15,22 @@
 The main entry point to run the PPO algorithm
 """
 
+# [seek-apps fork] Fix PyTorch memory allocator hoarding reserved blocks.
+# Must be set before any CUDA allocation. Enables expandable segments so
+# reserved-but-unallocated memory becomes usable for new allocations.
+import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+# [seek-apps fork] Import unsloth BEFORE transformers/peft when available.
+# Unsloth patches these libraries at import time for optimized kernels.
+# Only import on GPU workers (not the Ray driver which has no GPU).
+try:
+    import torch
+    if torch.cuda.is_available():
+        import unsloth  # noqa: F401 — must be first import
+except (ImportError, Exception):
+    pass
+
 import datetime
 import json
 import logging
@@ -375,8 +391,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # note that we have to create model in fp32. Otherwise, the optimizer is in bf16, which is incorrect
         # TODO(zhangchi.usc1992): 1. support create from random initialized model. 2. Support init with FSDP directly
-        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
-        self.processor = hf_processor(local_path, trust_remote_code=trust_remote_code)
+        # [seek-apps fork] Use tokenizer_path if set, fall back to model_path.
+        # Allows separate tokenizer (e.g., patched chat template) without modifying model weights.
+        tokenizer_source = self.config.model.get("tokenizer_path", None) or local_path
+        if tokenizer_source != local_path:
+            from verl.utils.fs import copy_to_local
+            tokenizer_source = copy_to_local(tokenizer_source, use_shm=False)
+        self.tokenizer = hf_tokenizer(tokenizer_source, trust_remote_code=trust_remote_code)
+        self.processor = hf_processor(tokenizer_source, trust_remote_code=trust_remote_code)
 
         if self.config.model.get("custom_chat_template", None) is not None:
             if self.processor is not None:
@@ -438,41 +460,62 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             use_meta_tensor=not actor_model_config.tie_word_embeddings, mesh=self.device_mesh
         )
 
-        with init_context(), warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            has_remote_code = hasattr(actor_model_config, "auto_map") and any(
-                actor_model_config.architectures[0] in val for val in actor_model_config.auto_map.values()
-            )
-            if has_remote_code:
-                auto_class = next(
-                    k for k, v in actor_model_config.auto_map.items() if actor_model_config.architectures[0] in v
-                )
-                match auto_class:
-                    case "AutoModelForVision2Seq":
-                        actor_module_class = AutoModelForVision2Seq
-                    case "AutoModelForCausalLM":
-                        actor_module_class = AutoModelForCausalLM
-                    case "AutoModelForImageTextToText":
-                        actor_module_class = AutoModelForImageTextToText
-                    case _:
-                        actor_module_class = AutoModel
-            else:
-                if type(actor_model_config) in AutoModelForVision2Seq._model_mapping.keys():
-                    actor_module_class = AutoModelForVision2Seq
-                elif type(actor_model_config) in AutoModelForCausalLM._model_mapping.keys():
-                    actor_module_class = AutoModelForCausalLM
-                elif type(actor_model_config) in AutoModelForImageTextToText._model_mapping.keys():
-                    actor_module_class = AutoModelForImageTextToText
-                else:
-                    actor_module_class = AutoModel
+        # [seek-apps fork] Unsloth model loader — QLoRA with optimized backward pass.
+        # Set model_loader: unsloth in config to use. Falls back to standard HF loading.
+        use_unsloth = self.config.model.get("model_loader", None) == "unsloth"
 
-            actor_module = actor_module_class.from_pretrained(
-                pretrained_model_name_or_path=local_path,
-                torch_dtype=torch_dtype,
-                config=actor_model_config,
-                trust_remote_code=trust_remote_code,
-                attn_implementation=attn_implementation,
+        if use_unsloth:
+            from unsloth import FastLanguageModel
+
+            load_in_4bit = self.config.model.get("load_in_4bit", True)
+            max_seq_length = self.config.model.get("max_seq_length", 4096)
+
+            actor_module, _unsloth_tokenizer = FastLanguageModel.from_pretrained(
+                model_name=local_path,
+                max_seq_length=max_seq_length,
+                dtype=None,  # auto-detect
+                load_in_4bit=load_in_4bit,
             )
+            if self.rank == 0:
+                print(f"[seek-apps] Loaded model via Unsloth (4bit={load_in_4bit}, max_seq={max_seq_length})")
+
+        else:
+            # Standard HF model loading (original verl path)
+            with init_context(), warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                has_remote_code = hasattr(actor_model_config, "auto_map") and any(
+                    actor_model_config.architectures[0] in val for val in actor_model_config.auto_map.values()
+                )
+                if has_remote_code:
+                    auto_class = next(
+                        k for k, v in actor_model_config.auto_map.items() if actor_model_config.architectures[0] in v
+                    )
+                    match auto_class:
+                        case "AutoModelForVision2Seq":
+                            actor_module_class = AutoModelForVision2Seq
+                        case "AutoModelForCausalLM":
+                            actor_module_class = AutoModelForCausalLM
+                        case "AutoModelForImageTextToText":
+                            actor_module_class = AutoModelForImageTextToText
+                        case _:
+                            actor_module_class = AutoModel
+                else:
+                    if type(actor_model_config) in AutoModelForVision2Seq._model_mapping.keys():
+                        actor_module_class = AutoModelForVision2Seq
+                    elif type(actor_model_config) in AutoModelForCausalLM._model_mapping.keys():
+                        actor_module_class = AutoModelForCausalLM
+                    elif type(actor_model_config) in AutoModelForImageTextToText._model_mapping.keys():
+                        actor_module_class = AutoModelForImageTextToText
+                    else:
+                        actor_module_class = AutoModel
+
+                actor_module = actor_module_class.from_pretrained(
+                    pretrained_model_name_or_path=local_path,
+                    torch_dtype=torch_dtype,
+                    config=actor_model_config,
+                    trust_remote_code=trust_remote_code,
+                    attn_implementation=attn_implementation,
+                )
 
             # Apply Liger kernel to the model if use_liger is set to True
             if use_liger:
@@ -522,16 +565,35 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     peft_config.task_type = TaskType.CAUSAL_LM
 
             else:
-                # Convert config to regular Python types before creating PEFT model
-                lora_config = {
-                    "task_type": TaskType.CAUSAL_LM,
-                    "r": self.config.model.lora_rank,
-                    "lora_alpha": self.config.model.lora_alpha,
-                    "target_modules": convert_to_regular_types(self.config.model.target_modules),
-                    "exclude_modules": convert_to_regular_types(self.config.model.exclude_modules),
-                    "bias": "none",
-                }
-                actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
+                if use_unsloth:
+                    # [seek-apps fork] Unsloth LoRA — optimized backward kernels + gradient checkpointing
+                    from unsloth import FastLanguageModel as _FLM
+
+                    lora_targets = convert_to_regular_types(self.config.model.target_modules)
+                    if lora_targets == "all-linear":
+                        lora_targets = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+                    actor_module = _FLM.get_peft_model(
+                        actor_module,
+                        r=self.config.model.lora_rank,
+                        lora_alpha=self.config.model.lora_alpha,
+                        target_modules=lora_targets,
+                        use_gradient_checkpointing="unsloth",
+                        random_state=42,
+                    )
+                    if self.rank == 0:
+                        print(f"[seek-apps] Applied Unsloth LoRA (r={self.config.model.lora_rank})")
+                else:
+                    # Standard PEFT LoRA (original verl path)
+                    lora_config = {
+                        "task_type": TaskType.CAUSAL_LM,
+                        "r": self.config.model.lora_rank,
+                        "lora_alpha": self.config.model.lora_alpha,
+                        "target_modules": convert_to_regular_types(self.config.model.target_modules),
+                        "exclude_modules": convert_to_regular_types(self.config.model.exclude_modules),
+                        "bias": "none",
+                    }
+                    actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
 
         self.use_orig_params = fsdp_config.get("use_orig_params", False)
         if self.config.actor.get("freeze_vision_tower", False):
@@ -598,7 +660,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation
         cpu_offload = None if role == "actor" else CPUOffload(offload_params=True)
         fsdp_strategy = self.config.actor.strategy
-        if fsdp_strategy == "fsdp":
+        if use_unsloth and torch.distributed.get_world_size() == 1:
+            # [seek-apps fork] Skip FSDP wrapping for Unsloth on single GPU.
+            # On single GPU, FSDP uses NO_SHARD which adds overhead without benefit.
+            # The model is already on GPU with LoRA and gradient checkpointing applied by Unsloth.
+            actor_module_fsdp = actor_module
+            if self.rank == 0:
+                print("[seek-apps] Skipped FSDP wrapping for Unsloth single-GPU mode")
+        elif fsdp_strategy == "fsdp":
             actor_module_fsdp = FSDP(
                 actor_module,
                 cpu_offload=cpu_offload,
@@ -936,7 +1005,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_rollout:
             self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
 
-        if self._is_ref:
+        # [seek-apps fork] Skip ref model when actor config says no KL loss.
+        # Dr.GRPO with use_kl_loss=False means the ref model is never queried — pure VRAM waste.
+        _use_kl = self.config.actor.get("use_kl_loss", True)
+        _skip_ref = not _use_kl
+        if _skip_ref and self._is_ref and self.rank == 0:
+            print("[seek-apps] Skipping ref model — use_kl_loss=False, no KL penalty active")
+
+        if self._is_ref and not _skip_ref:
             ref_model_path = self.config.model.path
             ref_model = self.config.ref.get("model", None)
             if ref_model is not None:
@@ -1012,6 +1088,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_offload_optimizer:
             load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
 
+        # [seek-apps fork] Diagnostic + release reserved GPU memory before training.
+        import logging as _logging
+        _logging.getLogger(__name__).info(
+            f"GPU before update_actor: {torch.cuda.memory_allocated()/1e9:.2f}GB allocated, "
+            f"{torch.cuda.memory_reserved()/1e9:.2f}GB reserved"
+        )
+        torch.cuda.empty_cache()
+
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
             data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
@@ -1076,8 +1160,25 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             loop.run_until_complete(self.rollout_mode())
             log_gpu_memory_usage("After switch to rollout mode", logger=logger)
 
+        # [seek-apps fork] Switch Unsloth to inference mode before rollout generation.
+        # Unsloth patches attention for training; for_inference() restores standard HF attention.
+        _unsloth_mode = self.config.model.get("model_loader", None) == "unsloth"
+        if _unsloth_mode:
+            try:
+                from unsloth import FastLanguageModel as _FLM
+                _FLM.for_inference(self.actor_module_fsdp)
+            except Exception:
+                pass
+
         with simple_timer("generate_sequences", timing_generate):
             output = self.rollout.generate_sequences(prompts=prompts)
+
+        # [seek-apps fork] Switch back to training mode — re-enables Unsloth optimized kernels
+        if _unsloth_mode:
+            try:
+                _FLM.for_training(self.actor_module_fsdp)
+            except Exception:
+                pass
 
         if _need_context_switch:
             loop.run_until_complete(self.trainer_mode())
