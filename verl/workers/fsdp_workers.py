@@ -16,10 +16,11 @@ The main entry point to run the PPO algorithm
 """
 
 # [seek-apps fork] Fix PyTorch memory allocator hoarding reserved blocks.
-# Must be set before any CUDA allocation. Enables expandable segments so
-# reserved-but-unallocated memory becomes usable for new allocations.
+# expandable_segments is INCOMPATIBLE with Unsloth vLLM Standby mode (CuMemAllocator).
+# Only set when Standby is not active.
 import os
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+if os.environ.get("UNSLOTH_VLLM_STANDBY", "0") == "0":
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 # [seek-apps fork] Import unsloth BEFORE transformers/peft when available.
 # Unsloth patches these libraries at import time for optimized kernels.
@@ -469,15 +470,25 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             load_in_4bit = self.config.model.get("load_in_4bit", True)
             max_seq_length = self.config.model.get("max_seq_length", 4096)
+            use_fast_inference = self.config.model.get("fast_inference", False)
 
-            actor_module, _unsloth_tokenizer = FastLanguageModel.from_pretrained(
+            from_pretrained_kwargs = dict(
                 model_name=local_path,
                 max_seq_length=max_seq_length,
                 dtype=None,  # auto-detect
                 load_in_4bit=load_in_4bit,
             )
+
+            # [seek-apps fork] Enable vLLM-backed fast inference for faster rollout
+            if use_fast_inference:
+                from_pretrained_kwargs["fast_inference"] = True
+                from_pretrained_kwargs["max_lora_rank"] = self.config.model.get("lora_rank", 16)
+                from_pretrained_kwargs["gpu_memory_utilization"] = self.config.model.get("gpu_memory_utilization", 0.6)
+
+            actor_module, _unsloth_tokenizer = FastLanguageModel.from_pretrained(**from_pretrained_kwargs)
             if self.rank == 0:
-                print(f"[seek-apps] Loaded model via Unsloth (4bit={load_in_4bit}, max_seq={max_seq_length})")
+                fi_str = " + vLLM fast_inference" if use_fast_inference else ""
+                print(f"[seek-apps] Loaded model via Unsloth (4bit={load_in_4bit}, max_seq={max_seq_length}{fi_str})")
 
         else:
             # Standard HF model loading (original verl path)
@@ -789,13 +800,24 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # 4. build rollout model
         log_gpu_memory_usage(f"Before building {self.config.rollout.name} rollout", logger=logger)
         if rollout_name == "hf":
-            # ── [seek-apps fork] HF rollout: bypass async server registry, use FSDP module directly ──
-            # get_rollout_class("hf", "async") fails (HF not registered in async registry).
-            # HFRollout uses actor_module_fsdp directly — no separate inference server needed.
-            # Related: verl issue #1940 (HF rollout broken after async rollout refactor).
-            from verl.workers.rollout.hf_rollout import HFRollout
+            # [seek-apps fork] Use Unsloth vLLM rollout when fast_inference=True, else HF rollout
+            use_fast_inference = self.config.model.get("fast_inference", False)
+            if use_fast_inference and hasattr(self.actor_module_fsdp, "fast_generate"):
+                from verl.workers.rollout.unsloth_vllm_rollout import UnslothVLLMRollout
 
-            self.rollout = HFRollout(module=self.actor_module_fsdp, config=self.config.rollout)
+                self.rollout = UnslothVLLMRollout(
+                    module=self.actor_module_fsdp,
+                    tokenizer=self.tokenizer,
+                    config=self.config.rollout,
+                )
+                if self.rank == 0:
+                    print("[seek-apps] Using UnslothVLLMRollout (vLLM fast_generate)")
+            else:
+                from verl.workers.rollout.hf_rollout import HFRollout
+
+                self.rollout = HFRollout(module=self.actor_module_fsdp, config=self.config.rollout)
+                if self.rank == 0 and use_fast_inference:
+                    print("[seek-apps] WARNING: fast_inference=True but model.fast_generate not found, falling back to HFRollout")
         else:
             self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
                 config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
@@ -1161,9 +1183,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             log_gpu_memory_usage("After switch to rollout mode", logger=logger)
 
         # [seek-apps fork] Switch Unsloth to inference mode before rollout generation.
-        # Unsloth patches attention for training; for_inference() restores standard HF attention.
+        # Skip when using fast_inference — vLLM handles inference independently.
         _unsloth_mode = self.config.model.get("model_loader", None) == "unsloth"
-        if _unsloth_mode:
+        _use_fast_inference = self.config.model.get("fast_inference", False)
+        if _unsloth_mode and not _use_fast_inference:
             try:
                 from unsloth import FastLanguageModel as _FLM
                 _FLM.for_inference(self.actor_module_fsdp)
@@ -1174,7 +1197,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             output = self.rollout.generate_sequences(prompts=prompts)
 
         # [seek-apps fork] Switch back to training mode — re-enables Unsloth optimized kernels
-        if _unsloth_mode:
+        if _unsloth_mode and not _use_fast_inference:
             try:
                 _FLM.for_training(self.actor_module_fsdp)
             except Exception:
