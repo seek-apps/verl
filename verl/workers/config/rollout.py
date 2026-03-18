@@ -243,6 +243,11 @@ class RolloutConfig(BaseConfig):
 
     mtp: MtpConfig = field(default_factory=MtpConfig)
 
+    # [seek-apps fork] Token IDs to suppress during generation.
+    # Use case: block <think> (151667) and </think> (151668) in Qwen3 to prevent
+    # thinking mode when training with structured XML output.
+    suppress_tokens: Optional[list] = None
+
     qat: Optional[dict] = None
 
     def __post_init__(self):

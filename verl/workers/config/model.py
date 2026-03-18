@@ -142,6 +142,11 @@ class HFModelConfig(BaseConfig):
 
     mtp: MtpConfig = field(default_factory=MtpConfig)
 
+    # [seek-apps fork] Unsloth integration
+    model_loader: Optional[str] = None  # "unsloth" or None (default HF loading)
+    load_in_4bit: bool = False          # QLoRA 4-bit quantization (requires model_loader=unsloth)
+    max_seq_length: int = 4096          # Max sequence length for Unsloth RoPE scaling
+
     def __post_init__(self):
         import_external_libs(self.external_lib)
 

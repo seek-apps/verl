@@ -310,12 +310,16 @@ class TaskRunner:
         )
 
         # Instantiate the tokenizer and processor.
+        # [seek-apps fork] Use tokenizer_path if set, fall back to model path.
         from verl.utils import hf_processor, hf_tokenizer
 
         trust_remote_code = config.data.get("trust_remote_code", False)
-        tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+        tokenizer_source = config.actor_rollout_ref.model.get("tokenizer_path", None) or local_path
+        if tokenizer_source != local_path:
+            tokenizer_source = copy_to_local(tokenizer_source, use_shm=False)
+        tokenizer = hf_tokenizer(tokenizer_source, trust_remote_code=trust_remote_code)
         # Used for multimodal LLM, could be None
-        processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
+        processor = hf_processor(tokenizer_source, trust_remote_code=trust_remote_code, use_fast=True)
 
         resource_pool_manager = self.init_resource_pool_mgr(config)
 

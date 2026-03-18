@@ -100,6 +100,13 @@ class HFRollout(BaseRollout):
                 "num_return_sequences": 1,
             }
 
+        # [seek-apps fork] Pass suppress_tokens from rollout config if set.
+        # Use case: suppress <think>/<\/think> tokens (151667/151668) in Qwen3 to prevent
+        # thinking mode when training with structured XML output (QGRE).
+        suppress_tokens = self.config.get("suppress_tokens", None)
+        if suppress_tokens:
+            kwargs["suppress_tokens"] = list(suppress_tokens)
+
         # make config according to generate mode
         generation_config = GenerationConfig(**kwargs)
 
@@ -116,19 +123,30 @@ class HFRollout(BaseRollout):
         param_ctx = contextlib.nullcontext()
 
         if isinstance(self.module, FSDP):
-            # recurse need to set to False according to https://github.com/pytorch/pytorch/issues/100069
             param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
+
+        # [seek-apps fork] Don't pass position_ids when Unsloth is active.
+        # Unsloth patches attention internals — passing pre-computed position_ids
+        # causes shape mismatch [heads, 1, head_dim] vs [heads, seq_len, head_dim]
+        # during autoregressive generation. HF generate computes them correctly internally.
+        _use_unsloth = self.config.get("suppress_tokens", None) is not None or not isinstance(self.module, FSDP)
+        try:
+            import unsloth
+            _use_unsloth = True
+        except ImportError:
+            _use_unsloth = False
+
         with param_ctx, torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
             output = self.module.generate(
                 input_ids=idx,
                 attention_mask=attention_mask,
-                position_ids=position_ids,
+                **({"position_ids": position_ids} if not _use_unsloth else {}),
                 do_sample=do_sample,
                 max_new_tokens=response_length,
                 eos_token_id=eos_token_id,
                 pad_token_id=pad_token_id,
                 generation_config=generation_config,
-                output_scores=False,  # this is potentially very large
+                output_scores=False,
                 return_dict_in_generate=True,
                 use_cache=True,
             )
