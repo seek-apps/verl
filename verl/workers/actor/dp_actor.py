@@ -367,6 +367,10 @@ class DataParallelPPOActor(BasePPOActor):
 
                     logits.div_(temperature)
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
+                    # [seek-apps fork] Cast logits to fp32 before log_softmax to prevent
+                    # bf16 gradient overflow on 151K vocab backward. The backward through
+                    # log_softmax stays in fp32, eliminating nan grad_norm.
+                    logits = logits.float()
                     log_probs = logprobs_from_logits(logits, micro_batch["responses"])
                     if calculate_entropy:
                         if not self.config.entropy_checkpointing:
