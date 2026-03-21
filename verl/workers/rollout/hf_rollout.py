@@ -38,7 +38,7 @@ __all__ = ["HFRollout"]
 
 class HFRollout(BaseRollout):
     def __init__(self, module: nn.Module, config):
-        # ── [seek-apps fork] Skip BaseRollout.__init__ — HFRollout uses the actor FSDP module
+        # ── [torad-labs fork] Skip BaseRollout.__init__ — HFRollout uses the actor FSDP module
         # directly. BaseRollout.__init__ expects (config, model_config, device_mesh) for the
         # async server-based rollouts (vllm/sglang/trtllm). HFRollout bypasses that path.
         # Related: verl issue #1940 (HF rollout broken after async rollout refactor).
@@ -100,7 +100,7 @@ class HFRollout(BaseRollout):
                 "num_return_sequences": 1,
             }
 
-        # [seek-apps fork] Pass suppress_tokens from rollout config if set.
+        # [torad-labs fork] Pass suppress_tokens from rollout config if set.
         # Use case: suppress <think>/<\/think> tokens (151667/151668) in Qwen3 to prevent
         # thinking mode when training with structured XML output (QGRE).
         suppress_tokens = self.config.get("suppress_tokens", None)
@@ -125,7 +125,7 @@ class HFRollout(BaseRollout):
         if isinstance(self.module, FSDP):
             param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
 
-        # [seek-apps fork] Don't pass position_ids when Unsloth is active.
+        # [torad-labs fork] Don't pass position_ids when Unsloth is active.
         # Unsloth patches attention internals — passing pre-computed position_ids
         # causes shape mismatch [heads, 1, head_dim] vs [heads, seq_len, head_dim]
         # during autoregressive generation. HF generate computes them correctly internally.

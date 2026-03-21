@@ -18,7 +18,7 @@ import os
 
 from packaging.version import parse as parse_version
 
-# [seek-apps fork] Lazy-import DataProto to avoid pulling in transformers at verl import time.
+# [torad-labs fork] Lazy-import DataProto to avoid pulling in transformers at verl import time.
 # verl.protocol.DataProto transitively imports transformers. If transformers loads before
 # Unsloth (which patches transformers at import time), Unsloth's memory optimizations
 # silently fail — gradient offloading, efficient backward kernels all broken.

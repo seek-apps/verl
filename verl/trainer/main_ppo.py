@@ -310,7 +310,7 @@ class TaskRunner:
         )
 
         # Instantiate the tokenizer and processor.
-        # [seek-apps fork] Use tokenizer_path if set, fall back to model path.
+        # [torad-labs fork] Use tokenizer_path if set, fall back to model path.
         from verl.utils import hf_processor, hf_tokenizer
 
         trust_remote_code = config.data.get("trust_remote_code", False)
@@ -334,7 +334,7 @@ class TaskRunner:
             is_train=True,
             max_samples=config.data.get("train_max_samples", -1),
         )
-        # ── [seek-apps fork] allow val_files: null to skip validation dataset creation ──
+        # ── [torad-labs fork] allow val_files: null to skip validation dataset creation ──
         # Upstream unconditionally calls create_rl_dataset even when val_files is None,
         # causing TypeError when test_freq: -1 (no validation intended). Guard it here.
         val_dataset = (

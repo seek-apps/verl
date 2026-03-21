@@ -367,7 +367,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                     logits.div_(temperature)
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
-                    # [seek-apps fork] Cast logits to fp32 before log_softmax to prevent
+                    # [torad-labs fork] Cast logits to fp32 before log_softmax to prevent
                     # bf16 gradient overflow on 151K vocab backward. The backward through
                     # log_softmax stays in fp32, eliminating nan grad_norm.
                     logits = logits.float()
@@ -593,7 +593,7 @@ class DataParallelPPOActor(BasePPOActor):
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
                     log_prob = outputs["log_probs"]
-                    # [seek-apps fork] Clamp log_probs to prevent exact 0.0 in bf16.
+                    # [torad-labs fork] Clamp log_probs to prevent exact 0.0 in bf16.
                     # When the model assigns prob ≈ 1.0 to a token, log(1.0) = 0.0 exactly.
                     # This causes nan gradients in entropy and LLDS loss computation.
                     log_prob = log_prob.clamp(min=-1e4, max=-1e-4)
@@ -647,7 +647,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                     policy_loss = pg_loss
 
-                    # ── [seek-apps fork] LLDS — Lazy Likelihood Displacement Stabilization ──
+                    # ── [torad-labs fork] LLDS — Lazy Likelihood Displacement Stabilization ──
                     # arXiv:2512.04220. Regularizes displaced tokens in positive-advantage completions.
                     # Config: actor_rollout_ref.actor.llds_coef (default 0.0 = disabled).
                     llds_coef = getattr(self.config, "llds_coef", 0.0)
@@ -689,7 +689,7 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss * loss_scale_factor
                     else:
                         loss = policy_loss * loss_scale_factor
-                    # [seek-apps fork] Training diagnostic
+                    # [torad-labs fork] Training diagnostic
                     if torch.distributed.get_rank() == 0:
                         _loss_val = loss.detach().item()
                         _pg_val = pg_loss.detach().item()

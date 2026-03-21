@@ -2483,7 +2483,7 @@ def compute_policy_loss_bypass_mode(
     return pg_loss, pg_metrics
 
 
-# ── [seek-apps fork] LLDS — Lazy Likelihood Displacement Stabilization (arXiv:2512.04220) ────
+# ── [torad-labs fork] LLDS — Lazy Likelihood Displacement Stabilization (arXiv:2512.04220) ────
 # Auxiliary loss that penalizes silent log-prob decay on correct/positive completions.
 # Three-level gate: trajectory (response-level decline) + token (displaced) + action (adv ≥ 0).
 # Addresses training collapse precursor where reward looks stable but correct-answer log-probs

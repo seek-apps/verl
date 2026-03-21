@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# ── [seek-apps fork] HFAgentLoopManager — HF rollout without async HTTP server ────────────────
+# ── [torad-labs fork] HFAgentLoopManager — HF rollout without async HTTP server ────────────────
 # Replaces AgentLoopManager for rollout.name=hf. Dispatches generate_sequences directly
 # to the FSDP worker group via registered Ray remote calls — no vLLM/sglang server needed.
 #

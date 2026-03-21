@@ -15,14 +15,14 @@
 The main entry point to run the PPO algorithm
 """
 
-# [seek-apps fork] Fix PyTorch memory allocator hoarding reserved blocks.
+# [torad-labs fork] Fix PyTorch memory allocator hoarding reserved blocks.
 # expandable_segments is INCOMPATIBLE with Unsloth vLLM Standby mode (CuMemAllocator).
 # Only set when Standby is not active.
 import os
 if os.environ.get("UNSLOTH_VLLM_STANDBY", "0") == "0":
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-# [seek-apps fork] Import unsloth BEFORE transformers/peft when available.
+# [torad-labs fork] Import unsloth BEFORE transformers/peft when available.
 # Unsloth patches these libraries at import time for optimized kernels.
 # Only import on GPU workers (not the Ray driver which has no GPU).
 try:
@@ -392,7 +392,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # note that we have to create model in fp32. Otherwise, the optimizer is in bf16, which is incorrect
         # TODO(zhangchi.usc1992): 1. support create from random initialized model. 2. Support init with FSDP directly
-        # [seek-apps fork] Use tokenizer_path if set, fall back to model_path.
+        # [torad-labs fork] Use tokenizer_path if set, fall back to model_path.
         # Allows separate tokenizer (e.g., patched chat template) without modifying model weights.
         tokenizer_source = self.config.model.get("tokenizer_path", None) or local_path
         if tokenizer_source != local_path:
@@ -461,7 +461,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             use_meta_tensor=not actor_model_config.tie_word_embeddings, mesh=self.device_mesh
         )
 
-        # [seek-apps fork] Unsloth model loader — QLoRA with optimized backward pass.
+        # [torad-labs fork] Unsloth model loader — QLoRA with optimized backward pass.
         # Set model_loader: unsloth in config to use. Falls back to standard HF loading.
         use_unsloth = self.config.model.get("model_loader", None) == "unsloth"
 
@@ -479,16 +479,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 load_in_4bit=load_in_4bit,
             )
 
-            # [seek-apps fork] Enable vLLM-backed fast inference for faster rollout
+            # [torad-labs fork] Enable vLLM-backed fast inference for faster rollout
             if use_fast_inference:
                 from_pretrained_kwargs["fast_inference"] = True
                 from_pretrained_kwargs["max_lora_rank"] = self.config.model.get("lora_rank", 16)
                 from_pretrained_kwargs["gpu_memory_utilization"] = self.config.model.get("gpu_memory_utilization", 0.6)
 
             actor_module, _unsloth_tokenizer = FastLanguageModel.from_pretrained(**from_pretrained_kwargs)
+
             if self.rank == 0:
                 fi_str = " + vLLM fast_inference" if use_fast_inference else ""
-                print(f"[seek-apps] Loaded model via Unsloth (4bit={load_in_4bit}, max_seq={max_seq_length}{fi_str})")
+                print(f"[torad-labs] Loaded model via Unsloth (4bit={load_in_4bit}, max_seq={max_seq_length}{fi_str})")
 
         else:
             # Standard HF model loading (original verl path)
@@ -577,7 +578,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             else:
                 if use_unsloth:
-                    # [seek-apps fork] Unsloth LoRA — optimized backward kernels + gradient checkpointing
+                    # [torad-labs fork] Unsloth LoRA — optimized backward kernels + gradient checkpointing
                     from unsloth import FastLanguageModel as _FLM
 
                     lora_targets = convert_to_regular_types(self.config.model.target_modules)
@@ -593,7 +594,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                         random_state=42,
                     )
                     if self.rank == 0:
-                        print(f"[seek-apps] Applied Unsloth LoRA (r={self.config.model.lora_rank})")
+                        print(f"[torad-labs] Applied Unsloth LoRA (r={self.config.model.lora_rank})")
                 else:
                     # Standard PEFT LoRA (original verl path)
                     lora_config = {
@@ -605,6 +606,43 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                         "bias": "none",
                     }
                     actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
+
+        # [torad-labs fork] Cast lm_head to fp32 to prevent bf16 gradient overflow
+        # on large vocab (151K for Qwen3). The backward through lm_head.weight in bf16
+        # overflows when activation norms are large, causing nan grad_norm on ~24% of
+        # micro-batches (16GB GPU). fp32 lm_head costs ~580MB extra but eliminates nans.
+        # See: peft#3073 (LoRA gradients not normalized by input norm → NaN)
+        # Must run AFTER LoRA wrapping (PEFT changes attribute path to base_model.model.lm_head)
+        if self._is_lora:
+            if self.rank == 0:
+                print(f"[torad-labs] lm_head fp32 fix: use_unsloth={use_unsloth}, _is_lora={self._is_lora}")
+            cast_done = False
+            for path in ["lm_head", "base_model.model.lm_head", "model.lm_head"]:
+                parts = path.split(".")
+                obj = actor_module
+                try:
+                    for p in parts:
+                        obj = getattr(obj, p)
+                    if hasattr(obj, "weight"):
+                        if self.rank == 0:
+                            print(f"[torad-labs] Found {path}: dtype={obj.weight.dtype}, shape={obj.weight.shape}")
+                        if obj.weight.dtype != torch.float32:
+                            obj.to(torch.float32)
+                            cast_done = True
+                            if self.rank == 0:
+                                print(f"[torad-labs] Cast {path} to fp32 (vocab={obj.weight.shape[0]}, +{obj.weight.numel()*2/1e6:.0f}MB)")
+                            break
+                        else:
+                            if self.rank == 0:
+                                print(f"[torad-labs] {path} already fp32, no cast needed")
+                            cast_done = True
+                            break
+                except AttributeError:
+                    if self.rank == 0:
+                        print(f"[torad-labs] {path} not found, trying next")
+                    continue
+            if not cast_done and self.rank == 0:
+                print(f"[torad-labs] WARNING: could not find lm_head to cast")
 
         self.use_orig_params = fsdp_config.get("use_orig_params", False)
         if self.config.actor.get("freeze_vision_tower", False):
@@ -672,12 +710,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         cpu_offload = None if role == "actor" else CPUOffload(offload_params=True)
         fsdp_strategy = self.config.actor.strategy
         if use_unsloth and torch.distributed.get_world_size() == 1:
-            # [seek-apps fork] Skip FSDP wrapping for Unsloth on single GPU.
+            # [torad-labs fork] Skip FSDP wrapping for Unsloth on single GPU.
             # On single GPU, FSDP uses NO_SHARD which adds overhead without benefit.
             # The model is already on GPU with LoRA and gradient checkpointing applied by Unsloth.
             actor_module_fsdp = actor_module
             if self.rank == 0:
-                print("[seek-apps] Skipped FSDP wrapping for Unsloth single-GPU mode")
+                print("[torad-labs] Skipped FSDP wrapping for Unsloth single-GPU mode")
         elif fsdp_strategy == "fsdp":
             actor_module_fsdp = FSDP(
                 actor_module,
@@ -800,7 +838,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # 4. build rollout model
         log_gpu_memory_usage(f"Before building {self.config.rollout.name} rollout", logger=logger)
         if rollout_name == "hf":
-            # [seek-apps fork] Use Unsloth vLLM rollout when fast_inference=True, else HF rollout
+            # [torad-labs fork] Use Unsloth vLLM rollout when fast_inference=True, else HF rollout
             use_fast_inference = self.config.model.get("fast_inference", False)
             if use_fast_inference and hasattr(self.actor_module_fsdp, "fast_generate"):
                 from verl.workers.rollout.unsloth_vllm_rollout import UnslothVLLMRollout
@@ -811,13 +849,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     config=self.config.rollout,
                 )
                 if self.rank == 0:
-                    print("[seek-apps] Using UnslothVLLMRollout (vLLM fast_generate)")
+                    print("[torad-labs] Using UnslothVLLMRollout (vLLM fast_generate)")
             else:
                 from verl.workers.rollout.hf_rollout import HFRollout
 
                 self.rollout = HFRollout(module=self.actor_module_fsdp, config=self.config.rollout)
                 if self.rank == 0 and use_fast_inference:
-                    print("[seek-apps] WARNING: fast_inference=True but model.fast_generate not found, falling back to HFRollout")
+                    print("[torad-labs] WARNING: fast_inference=True but model.fast_generate not found, falling back to HFRollout")
         else:
             self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
                 config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
@@ -1027,12 +1065,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_rollout:
             self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
 
-        # [seek-apps fork] Skip ref model when actor config says no KL loss.
+        # [torad-labs fork] Skip ref model when actor config says no KL loss.
         # Dr.GRPO with use_kl_loss=False means the ref model is never queried — pure VRAM waste.
         _use_kl = self.config.actor.get("use_kl_loss", True)
         _skip_ref = not _use_kl
         if _skip_ref and self._is_ref and self.rank == 0:
-            print("[seek-apps] Skipping ref model — use_kl_loss=False, no KL penalty active")
+            print("[torad-labs] Skipping ref model — use_kl_loss=False, no KL penalty active")
 
         if self._is_ref and not _skip_ref:
             ref_model_path = self.config.model.path
@@ -1110,7 +1148,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_offload_optimizer:
             load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
 
-        # [seek-apps fork] Diagnostic + release reserved GPU memory before training.
+        # [torad-labs fork] Diagnostic + release reserved GPU memory before training.
         import logging as _logging
         _logging.getLogger(__name__).info(
             f"GPU before update_actor: {torch.cuda.memory_allocated()/1e9:.2f}GB allocated, "
@@ -1173,7 +1211,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         prompts.meta_info.update(meta_info)
 
         timing_generate = {}
-        # ── [seek-apps fork] HF rollout uses actor_module_fsdp directly — no server weight sync ──
+        # ── [torad-labs fork] HF rollout uses actor_module_fsdp directly — no server weight sync ──
         # rollout_mode() syncs FSDP weights to the vLLM/sglang server. For HF rollout,
         # weights are already live in the FSDP module — no sync step needed.
         _need_context_switch = self._is_actor and self.config.rollout.name != "hf"
@@ -1182,7 +1220,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             loop.run_until_complete(self.rollout_mode())
             log_gpu_memory_usage("After switch to rollout mode", logger=logger)
 
-        # [seek-apps fork] Switch Unsloth to inference mode before rollout generation.
+        # [torad-labs fork] Switch Unsloth to inference mode before rollout generation.
         # Skip when using fast_inference — vLLM handles inference independently.
         _unsloth_mode = self.config.model.get("model_loader", None) == "unsloth"
         _use_fast_inference = self.config.model.get("fast_inference", False)
@@ -1196,7 +1234,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         with simple_timer("generate_sequences", timing_generate):
             output = self.rollout.generate_sequences(prompts=prompts)
 
-        # [seek-apps fork] Switch back to training mode — re-enables Unsloth optimized kernels
+        # [torad-labs fork] Switch back to training mode — re-enables Unsloth optimized kernels
         if _unsloth_mode and not _use_fast_inference:
             try:
                 _FLM.for_training(self.actor_module_fsdp)
@@ -1870,7 +1908,7 @@ class CriticWorker(Worker, DistProfilerExtension):
 class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None):
-        # ── [seek-apps fork] HF rollout: skip rollout_mode() — weights always live in FSDP module ──
+        # ── [torad-labs fork] HF rollout: skip rollout_mode() — weights always live in FSDP module ──
         if self.config.rollout.name != "hf":
             await self.rollout_mode()
         return True

@@ -51,7 +51,7 @@ class NaiveRewardManager(RewardManagerBase):
         extra_info["num_turns"] = num_turns
         extra_info["rollout_reward_scores"] = rollout_reward_scores
 
-        # [seek-apps fork] skip_special_tokens=False — expose <|im_end|> to reward fn
+        # [torad-labs fork] skip_special_tokens=False — expose <|im_end|> to reward fn
         # for loop detection and stop signal verification. Matches workers/reward_manager/naive.py.
         response_str = await self.loop.run_in_executor(
             None, lambda: self.tokenizer.decode(valid_response_ids, skip_special_tokens=False)

@@ -1,5 +1,5 @@
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
-# [seek-apps fork] Unsloth vLLM rollout — uses Unsloth's fast_generate (vLLM backend)
+# [torad-labs fork] Unsloth vLLM rollout — uses Unsloth's fast_generate (vLLM backend)
 # for 3-5x faster rollout generation compared to HF model.generate().
 #
 # Weight sync: LoRA weights are synced from PyTorch training model to vLLM

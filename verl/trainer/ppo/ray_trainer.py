@@ -324,7 +324,7 @@ class RayPPOTrainer:
                 self.processor,
                 max_samples=self.config.data.get("train_max_samples", -1),
             )
-        # ── [seek-apps fork] allow val_files: null to skip validation dataset creation ──
+        # ── [torad-labs fork] allow val_files: null to skip validation dataset creation ──
         if val_dataset is None and self.config.data.val_files is not None:
             val_dataset = create_rl_dataset(
                 self.config.data.val_files,
@@ -353,7 +353,7 @@ class RayPPOTrainer:
             sampler=train_sampler,
         )
 
-        # ── [seek-apps fork] skip val_dataloader when val_dataset is None (test_freq: -1) ──
+        # ── [torad-labs fork] skip val_dataloader when val_dataset is None (test_freq: -1) ──
         if self.val_dataset is not None:
             val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
             if val_batch_size is None:
@@ -448,7 +448,7 @@ class RayPPOTrainer:
                     batch.non_tensor_batch["request_id"].tolist(),
                 )
 
-            # [seek-apps fork] Use batch.non_tensor_batch for reward extras instead of
+            # [torad-labs fork] Use batch.non_tensor_batch for reward extras instead of
             # reward_extra_infos_dict. The dict has pre-filter_groups size (gen_batch_size × n),
             # while batch has post-filter size (train_batch_size × n). Mismatch causes len check
             # to fail in _dump_generations.
@@ -506,7 +506,7 @@ class RayPPOTrainer:
         # For agent loop, we need reward model keys to compute score.
         gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
 
-        # ── [seek-apps fork] HF rollout: tokenize raw_prompt into input_ids/attention_mask/position_ids ──
+        # ── [torad-labs fork] HF rollout: tokenize raw_prompt into input_ids/attention_mask/position_ids ──
         # In the async architecture, RLHFDataset only puts raw_prompt (chat messages) in non_tensor_batch
         # and dummy_tensor as a placeholder. The async server (vLLM/sglang) tokenizes inside AgentLoop.
         # HFRollout.generate_sequences expects pre-tokenized input_ids in batch.batch — we do it here.
@@ -1139,7 +1139,7 @@ class RayPPOTrainer:
         )
         metrics.update(global_balance_stats)
 
-    # ── [seek-apps fork] filter_groups — DAPO dynamic sampling (arXiv:2409.07236 §3.2) ──────────
+    # ── [torad-labs fork] filter_groups — DAPO dynamic sampling (arXiv:2409.07236 §3.2) ──────────
     # Filters groups where all completions have identical reward (std ≈ 0 → zero advantage → zero
     # gradient). Ported from DAPO recipe into main trainer. Backward-compatible: off by default.
     # Config: algorithm.filter_groups.enable (default False).
@@ -1254,7 +1254,7 @@ class RayPPOTrainer:
             # step 2: convert from padding to nopadding
             batch_td = left_right_2_no_padding(batch_td)
             # step 3: add meta info
-            # [seek-apps fork] Skip entropy in compute_log_prob to avoid OOM on large-vocab models.
+            # [torad-labs fork] Skip entropy in compute_log_prob to avoid OOM on large-vocab models.
             # entropy_from_logits materializes 3x the [batch, seq, vocab] tensor (~1.8 GB for 151K vocab).
             # Entropy here is only used for the actor/entropy METRIC, not training loss.
             # The actual entropy used in policy loss is computed inside update_actor's forward pass.
@@ -1376,7 +1376,7 @@ class RayPPOTrainer:
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
-        # ── [seek-apps fork] skip pre-train validation when val_dataset is None ──
+        # ── [torad-labs fork] skip pre-train validation when val_dataset is None ──
         if self.config.trainer.get("val_before_train", True) and self.val_dataloader is not None:
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
@@ -1503,7 +1503,7 @@ class RayPPOTrainer:
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
                             batch_reward = self._compute_reward_colocate(batch)
                             batch = batch.union(batch_reward)
-                        # ── [seek-apps fork] HF rollout: reward not computed during rollout (no agent loop).
+                        # ── [torad-labs fork] HF rollout: reward not computed during rollout (no agent loop).
                         # Compute it explicitly here. In the async path (vLLM/sglang), the agent loop calls
                         # the reward function during generation and puts rm_scores in the batch. HF rollout
                         # bypasses the agent loop, so we compute rewards synchronously after generation.
@@ -1557,7 +1557,7 @@ class RayPPOTrainer:
                                 )
                             batch = batch.union(old_log_prob)
 
-                            # [seek-apps fork] Offload old_log_probs to CPU to free ~2.4GB GPU memory
+                            # [torad-labs fork] Offload old_log_probs to CPU to free ~2.4GB GPU memory
                             # before update_actor. They travel back to GPU per micro-batch inside the worker.
                             if "old_log_probs" in batch.batch:
                                 batch.batch["old_log_probs"] = batch.batch["old_log_probs"].cpu()
@@ -1615,7 +1615,7 @@ class RayPPOTrainer:
                             # IS and off-policy metrics already have rollout_corr/ prefix
                             metrics.update(is_metrics)
 
-                        # ── [seek-apps fork] filter_groups — remove zero-advantage groups ──
+                        # ── [torad-labs fork] filter_groups — remove zero-advantage groups ──
                         fg_config = getattr(self.config.algorithm, "filter_groups", None)
                         if fg_config is not None and getattr(fg_config, "enable", False):
                             batch = self._apply_filter_groups(
